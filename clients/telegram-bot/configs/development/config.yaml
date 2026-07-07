@@ -1,0 +1,39 @@
+# Development configuration for the BrainBlitz Telegram bot.
+#
+# bot_token is intentionally left empty here: config.Load does not perform
+# shell-style variable substitution inside YAML values, it only overlays
+# BOT_-prefixed environment variables on top of this file. Set the real
+# token via the environment before running the bot:
+#   export BOT_TELEGRAM__BOT_TOKEN="<token from @BotFather>"
+telegram:
+  bot_token: ""
+
+backend:
+  user_service_url: "http://localhost/user-service"
+  match_service_url: "http://localhost/match-service"
+  game_service_ws_url: "ws://localhost/game-service/api/v1/process-game"
+  http_timeout: 10s
+
+# session_store selects where per-chat sessions (BrainBlitz user ID +
+# tokens) are kept. "memory" (the default if this section is omitted
+# entirely) loses every session on a bot restart, exactly like Phases 1-5.
+# "redis" persists sessions so a restart doesn't force everyone to /login
+# again — see docs/client/client-roadmap.md Phase 6. Only auth sessions are
+# ever persisted here; in-flight matchmaking/game state never is (there's
+# no backend API to resync it, so a restart still ends any in-progress
+# game — see the Phase 6 notes for why).
+session_store:
+  type: "memory"   # "memory" | "redis"
+  # redis_addr: "localhost:6379"
+  # ttl: 720h        # 30 days; how long an unused session survives in Redis
+
+# rate_limit bounds how fast this process makes outbound HTTP/WebSocket-
+# connect calls to the BrainBlitz backend, so a burst of client-side
+# retries across many chats can't hammer the gateway. Omitted or
+# requests_per_second <= 0 means unlimited (Phases 1-5's behavior).
+rate_limit:
+  # requests_per_second: 10
+  # burst: 5
+
+logging:
+  level: "debug"
