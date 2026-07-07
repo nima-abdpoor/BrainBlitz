@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -172,6 +173,62 @@ func TestDo_WaitsOnRateLimiterBeforeEveryAttempt(t *testing.T) {
 
 	if got := atomic.LoadInt32(&lim.calls); got != 2 {
 		t.Errorf("limiter Wait calls = %d, want 2 (once per attempt)", got)
+	}
+}
+
+// fakeMetrics is a Metrics double recording every observed call.
+type fakeMetrics struct {
+	mu    sync.Mutex
+	calls []struct {
+		method, path string
+		err          error
+	}
+}
+
+func (f *fakeMetrics) ObserveHTTPRequest(method, path string, _ time.Duration, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, struct {
+		method, path string
+		err          error
+	}{method, path, err})
+}
+
+func TestDo_RecordsMetricsPerAttempt(t *testing.T) {
+	var serverCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&serverCalls, 1)
+		if n < 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	m := &fakeMetrics{}
+	c := NewClient(server.URL, 2*time.Second, testLogger(),
+		WithMaxRetries(3), WithBackoff(time.Millisecond), WithMetrics(m))
+
+	resp, err := c.Do(context.Background(), http.MethodGet, "/metered", nil, nil)
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if len(m.calls) != 2 {
+		t.Fatalf("recorded %d attempts, want 2 (one failed, one succeeded)", len(m.calls))
+	}
+	if m.calls[0].err == nil {
+		t.Error("first attempt should have recorded a non-nil error")
+	}
+	if m.calls[1].err != nil {
+		t.Errorf("second attempt should have recorded nil error, got %v", m.calls[1].err)
+	}
+	for _, c := range m.calls {
+		if c.method != http.MethodGet || c.path != "/metered" {
+			t.Errorf("recorded call = %+v, want method=%s path=/metered", c, http.MethodGet)
+		}
 	}
 }
 

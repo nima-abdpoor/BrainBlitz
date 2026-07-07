@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,7 +17,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	goredis "github.com/redis/go-redis/v9"
 
-	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/apiclient/http"
+	apihttp "github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/apiclient/http"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/apiclient/ws"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/config"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/core/auth"
@@ -24,6 +26,7 @@ import (
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/core/profile"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/core/session"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/logger"
+	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/metrics"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/telegram"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/telegram/commands"
 	"github.com/nima-abdpoor/brain-blitz-telegram-bot/internal/telegram/conversation"
@@ -48,6 +51,10 @@ var wsConnectRetryPolicy = retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, 
 // when session_store.ttl isn't set — long enough to not surprise an
 // infrequent user, short enough to eventually reclaim abandoned chats.
 const defaultSessionTTL = 30 * 24 * time.Hour
+
+// defaultMetricsListenAddr is used when metrics.enabled is true but
+// metrics.listen_addr is left empty in config.
+const defaultMetricsListenAddr = ":9090"
 
 func main() {
 	if err := run(); err != nil {
@@ -75,14 +82,19 @@ func run() error {
 	}
 	log.Info("authenticated with telegram", "username", tgAPI.Self.UserName)
 
+	// recorder is always built (cheap: its own registry, no I/O) so every
+	// call site below can assume it's non-nil; whether it's actually served
+	// is gated separately by cfg.Metrics.Enabled in runMetricsServer.
+	recorder := metrics.New()
+
 	// A nil limiter (the default: rate_limit.requests_per_second <= 0) means
 	// every call site below skips rate limiting entirely — Phases 1-5's
 	// behavior, unchanged unless a deployment opts in.
 	var limiter *ratelimit.Limiter
-	var httpOpts []http.Option
+	httpOpts := []apihttp.Option{apihttp.WithMetrics(recorder)}
 	if cfg.RateLimit.RequestsPerSecond > 0 {
 		limiter = ratelimit.New(cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.Burst)
-		httpOpts = append(httpOpts, http.WithRateLimiter(limiter))
+		httpOpts = append(httpOpts, apihttp.WithRateLimiter(limiter))
 	}
 
 	sessionStore, err := newSessionStore(cfg.SessionStore, log)
@@ -90,7 +102,7 @@ func run() error {
 		return fmt.Errorf("building session store: %w", err)
 	}
 
-	userClient := http.NewUserClient(http.NewClient(cfg.Backend.UserServiceURL, cfg.Backend.HTTPTimeout, log, httpOpts...))
+	userClient := apihttp.NewUserClient(apihttp.NewClient(cfg.Backend.UserServiceURL, cfg.Backend.HTTPTimeout, log, httpOpts...))
 	authSvc := auth.NewService(userClient, sessionStore)
 	profileSvc := profile.NewService(userClient, sessionStore)
 
@@ -127,6 +139,7 @@ func run() error {
 	// construction-order cycle (see matchmakingMgr.SetGameHandler's doc
 	// comment).
 	matchmakingMgr := matchmaking.NewManager(dialer, matchmakingNotifier, sessionStore, nil)
+	matchmakingMgr.SetMetrics(recorder)
 
 	gameNotifier := telegram.NewGameNotifier(tgAPI, log)
 	gameMgr := game.NewManager(gameNotifier, matchmakingMgr, log)
@@ -135,6 +148,7 @@ func run() error {
 	handlers := commands.NewHandlers(authSvc, profileSvc, matchmakingMgr, gameMgr, conversation.NewMemoryStore())
 
 	bot := telegram.New(tgAPI, log)
+	bot.SetMetrics(recorder)
 	bot.RegisterCommand("start", handlers.Start)
 	bot.RegisterCommand("help", handlers.Help)
 	bot.RegisterCommand("profile", middleware.RequireAuth(authSvc, handlers.Profile))
@@ -155,8 +169,45 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	stopMetrics := runMetricsServer(cfg.Metrics, recorder, log)
+	defer stopMetrics()
+
 	runBot(ctx, tgAPI, bot, log)
 	return nil
+}
+
+// runMetricsServer starts the Prometheus /metrics endpoint in the
+// background when cfg.Enabled, and returns a func that shuts it down. When
+// disabled (the default), it does nothing and returns a no-op — Phases 1-6
+// deployments that never set metrics.enabled see zero behavior change.
+func runMetricsServer(cfg config.Metrics, recorder *metrics.Recorder, log *slog.Logger) func() {
+	if !cfg.Enabled {
+		return func() {}
+	}
+
+	addr := cfg.ListenAddr
+	if addr == "" {
+		addr = defaultMetricsListenAddr
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", recorder.Handler())
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server failed", "addr", addr, "error", err)
+		}
+	}()
+	log.Info("serving metrics", "addr", addr, "path", "/metrics")
+
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Warn("metrics server shutdown error", "error", err)
+		}
+	}
 }
 
 // runBot starts long-polling and blocks until ctx is cancelled, then stops

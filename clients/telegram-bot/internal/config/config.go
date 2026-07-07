@@ -23,6 +23,7 @@ type Config struct {
 	Backend      Backend      `koanf:"backend"`
 	SessionStore SessionStore `koanf:"session_store"`
 	RateLimit    RateLimit    `koanf:"rate_limit"`
+	Metrics      Metrics      `koanf:"metrics"`
 	Logging      Logging      `koanf:"logging"`
 }
 
@@ -65,6 +66,14 @@ type RateLimit struct {
 // Logging holds structured-logging settings.
 type Logging struct {
 	Level string `koanf:"level"`
+}
+
+// Metrics configures the Prometheus /metrics HTTP endpoint. Disabled by
+// default (the zero value), matching Phases 1-6's behavior for any
+// deployment that doesn't opt in.
+type Metrics struct {
+	Enabled    bool   `koanf:"enabled"`
+	ListenAddr string `koanf:"listen_addr"`
 }
 
 // Load reads yamlPath (if non-empty) and overlays BOT_-prefixed environment

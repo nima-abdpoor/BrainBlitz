@@ -1,0 +1,107 @@
+# IMPORTANT: replicas must stay at 1. Telegram's long-polling getUpdates
+# API has no fan-out between multiple consumers of the same bot token —
+# running more than one replica means both would race to poll and process
+# the same updates, double-handling commands and callbacks. Scale this
+# service by moving to Telegram's webhook mode (out of scope for this
+# phase — see docs/client/client-roadmap.md), not by raising replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-bot
+  labels:
+    app: telegram-bot
+spec:
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 4
+  replicas: 1
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app: telegram-bot
+  template:
+    metadata:
+      labels:
+        app: telegram-bot
+        version: v1
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/nima-abdpoor/brain-blitz/telegram-bot:latest
+          imagePullPolicy: Always
+          ports:
+            - name: metrics
+              protocol: TCP
+              containerPort: 9090
+          env:
+            - name: BOT_TELEGRAM__BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: telegram-bot-secret
+                  key: bot-token
+            - name: BOT_BACKEND__USER_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: user-service-url
+            - name: BOT_BACKEND__MATCH_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: match-service-url
+            - name: BOT_BACKEND__GAME_SERVICE_WS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: game-service-ws-url
+            - name: BOT_SESSION_STORE__TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: session-store-type
+            - name: BOT_SESSION_STORE__REDIS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: session-store-redis-addr
+            - name: BOT_METRICS__ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: metrics-enabled
+            - name: BOT_METRICS__LISTEN_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: metrics-listen-addr
+            - name: BOT_LOGGING__LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: telegram-bot-configmap
+                  key: logging-level
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "256Mi"
+              cpu: "100m"
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telegram-bot-service
+spec:
+  selector:
+    app: telegram-bot
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 9090
+      targetPort: 9090

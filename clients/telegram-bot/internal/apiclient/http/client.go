@@ -34,6 +34,16 @@ type RateLimiter interface {
 	Wait(ctx context.Context) error
 }
 
+// Metrics is the subset of internal/metrics.Recorder this package depends
+// on, defined here (the consumer) for the same reason as RateLimiter.
+type Metrics interface {
+	ObserveHTTPRequest(method, path string, duration time.Duration, err error)
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) ObserveHTTPRequest(string, string, time.Duration, error) {}
+
 // Client is a minimal, retrying HTTP client bound to a single backend
 // service's base URL (e.g. the user-service gateway path).
 type Client struct {
@@ -43,6 +53,7 @@ type Client struct {
 	maxRetries int
 	backoff    time.Duration
 	limiter    RateLimiter
+	metrics    Metrics
 }
 
 // Option customizes a Client constructed by NewClient.
@@ -69,6 +80,13 @@ func WithRateLimiter(lim RateLimiter) Option {
 	return func(c *Client) { c.limiter = lim }
 }
 
+// WithMetrics makes every attempt (including retries) record its latency
+// and, on failure, an error count via m. Optional — a Client with no
+// metrics configured (the default) records nothing.
+func WithMetrics(m Metrics) Option {
+	return func(c *Client) { c.metrics = m }
+}
+
 // NewClient builds a Client for a single backend base URL. logger must not
 // be nil; callers should pass a no-op logger (e.g. slog.New(slog.DiscardHandler))
 // in contexts where logging is unwanted, rather than passing nil.
@@ -79,6 +97,7 @@ func NewClient(baseURL string, timeout time.Duration, logger *slog.Logger, opts 
 		logger:     logger,
 		maxRetries: defaultMaxRetries,
 		backoff:    defaultBackoff,
+		metrics:    noopMetrics{},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -106,7 +125,9 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte, heade
 			}
 		}
 
+		start := time.Now()
 		r, err := c.attempt(ctx, method, url, body, headers)
+		c.metrics.ObserveHTTPRequest(method, path, time.Since(start), err)
 		if err != nil {
 			c.logger.Warn("http request attempt failed", "method", method, "path", path, "error", err)
 			return err

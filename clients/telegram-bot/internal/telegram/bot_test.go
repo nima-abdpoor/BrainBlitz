@@ -29,6 +29,16 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// fakeMetrics is a Metrics double recording every call, so tests can assert
+// Bot records commands/callbacks without a real Prometheus registry.
+type fakeMetrics struct {
+	commands  []string
+	callbacks []string
+}
+
+func (f *fakeMetrics) CommandHandled(command string) { f.commands = append(f.commands, command) }
+func (f *fakeMetrics) CallbackHandled(data string)   { f.callbacks = append(f.callbacks, data) }
+
 func commandMessage(chatID int64, command string) *tgbotapi.Message {
 	text := "/" + command
 	return &tgbotapi.Message{
@@ -195,6 +205,62 @@ func TestBot_IgnoresUnrecognizedCallbackData(t *testing.T) {
 
 	if len(sender.sent) != 1 { // only the callback-query ack
 		t.Errorf("sent %d messages for unrecognized callback data, want 1 (ack only)", len(sender.sent))
+	}
+}
+
+func TestBot_RecordsCommandMetric(t *testing.T) {
+	sender := &fakeSender{}
+	bot := New(sender, testLogger())
+	metrics := &fakeMetrics{}
+	bot.SetMetrics(metrics)
+	bot.RegisterCommand("start", func(_ context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
+		return tgbotapi.NewMessage(msg.Chat.ID, "hi"), nil
+	})
+
+	bot.handleUpdate(context.Background(), tgbotapi.Update{Message: commandMessage(1, "start")})
+
+	if len(metrics.commands) != 1 || metrics.commands[0] != "start" {
+		t.Errorf("recorded commands = %v, want [start]", metrics.commands)
+	}
+}
+
+func TestBot_DoesNotRecordMetricForUnrecognizedCommand(t *testing.T) {
+	sender := &fakeSender{}
+	bot := New(sender, testLogger())
+	metrics := &fakeMetrics{}
+	bot.SetMetrics(metrics)
+
+	bot.handleUpdate(context.Background(), tgbotapi.Update{Message: commandMessage(1, "unknown")})
+
+	if len(metrics.commands) != 0 {
+		t.Errorf("recorded commands = %v, want none for an unregistered command", metrics.commands)
+	}
+}
+
+func TestBot_RecordsCallbackMetric_ExactAndPrefix(t *testing.T) {
+	sender := &fakeSender{}
+	bot := New(sender, testLogger())
+	metrics := &fakeMetrics{}
+	bot.SetMetrics(metrics)
+	bot.RegisterCallback("play", func(_ context.Context, cb *tgbotapi.CallbackQuery) (tgbotapi.Chattable, error) {
+		return nil, nil
+	})
+	bot.RegisterCallbackPrefix("answer:", func(context.Context, *tgbotapi.CallbackQuery, string) (tgbotapi.Chattable, error) {
+		return nil, nil
+	})
+
+	bot.handleUpdate(context.Background(), callbackUpdate(1, "play"))
+	bot.handleUpdate(context.Background(), callbackUpdate(1, "answer:q1|0"))
+	bot.handleUpdate(context.Background(), callbackUpdate(1, "answer:q2|1"))
+
+	want := []string{"play", "answer:", "answer:"}
+	if len(metrics.callbacks) != len(want) {
+		t.Fatalf("recorded callbacks = %v, want %v", metrics.callbacks, want)
+	}
+	for i, w := range want {
+		if metrics.callbacks[i] != w {
+			t.Errorf("callback %d = %q, want %q (prefix matches must record the prefix, not the full per-question data)", i, metrics.callbacks[i], w)
+		}
 	}
 }
 

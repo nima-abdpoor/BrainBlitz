@@ -35,5 +35,14 @@ rate_limit:
   # requests_per_second: 10
   # burst: 5
 
+# metrics serves a Prometheus /metrics endpoint (bot_commands_total,
+# bot_callbacks_total, bot_http_request_duration_seconds,
+# bot_http_request_errors_total, bot_active_ws_connections). Disabled by
+# default (Phases 1-6's behavior); enable and scrape it in any environment
+# with a Prometheus instance (see infra/deploy in the main repo).
+metrics:
+  enabled: false
+  # listen_addr: ":9090"
+
 logging:
   level: "debug"

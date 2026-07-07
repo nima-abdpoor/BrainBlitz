@@ -96,6 +96,32 @@ func (n *fakeNotifier) NotifyDisconnected(chatID int64) {
 	n.disconnected <- chatID
 }
 
+// fakeMetrics is a Metrics double tracking a running open-connections
+// count, so tests can assert the gauge accounting nets to exactly one
+// decrement per increment for every code path that closes a connection.
+type fakeMetrics struct {
+	mu   sync.Mutex
+	open int
+}
+
+func (f *fakeMetrics) WSConnectionOpened() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.open++
+}
+
+func (f *fakeMetrics) WSConnectionClosed() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.open--
+}
+
+func (f *fakeMetrics) get() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.open
+}
+
 func newTestManager(t *testing.T, conn Connection, dialErr error, notifier *fakeNotifier) (*Manager, *session.MemoryStore) {
 	t.Helper()
 	sessions := session.NewMemoryStore()
@@ -469,5 +495,108 @@ func TestDisconnect_AfterAttach_NotifiesGameHandlerNotMatchmakingNotifier(t *tes
 	case call := <-notifier.disconnected:
 		t.Errorf("matchmaking.Notifier.NotifyDisconnected fired for a chat GameHandler had already taken over: %v", call)
 	default:
+	}
+}
+
+func TestMetrics_JoinQueueOpensConnection(t *testing.T) {
+	conn := newFakeConn()
+	notifier := newFakeNotifier()
+	mgr, sessions := newTestManager(t, conn, nil, notifier)
+	metrics := &fakeMetrics{}
+	mgr.SetMetrics(metrics)
+	mustSaveSession(t, sessions, testChatID)
+
+	if err := mgr.JoinQueue(context.Background(), testChatID, "SPORT"); err != nil {
+		t.Fatalf("JoinQueue returned error: %v", err)
+	}
+
+	if got := metrics.get(); got != 1 {
+		t.Errorf("open connections = %d, want 1 after a successful JoinQueue", got)
+	}
+}
+
+func TestMetrics_DialFailureDoesNotOpenConnection(t *testing.T) {
+	notifier := newFakeNotifier()
+	mgr, sessions := newTestManager(t, nil, errors.New("connection refused"), notifier)
+	metrics := &fakeMetrics{}
+	mgr.SetMetrics(metrics)
+	mustSaveSession(t, sessions, testChatID)
+
+	if err := mgr.JoinQueue(context.Background(), testChatID, "SPORT"); err == nil {
+		t.Fatal("JoinQueue returned nil error, want the dial failure")
+	}
+
+	if got := metrics.get(); got != 0 {
+		t.Errorf("open connections = %d, want 0 (dial never succeeded)", got)
+	}
+}
+
+func TestMetrics_CancelClosesConnection(t *testing.T) {
+	conn := newFakeConn()
+	notifier := newFakeNotifier()
+	mgr, sessions := newTestManager(t, conn, nil, notifier)
+	metrics := &fakeMetrics{}
+	mgr.SetMetrics(metrics)
+	mustSaveSession(t, sessions, testChatID)
+	if err := mgr.JoinQueue(context.Background(), testChatID, "SPORT"); err != nil {
+		t.Fatalf("JoinQueue returned error: %v", err)
+	}
+
+	if err := mgr.Cancel(testChatID); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+
+	if got := metrics.get(); got != 0 {
+		t.Errorf("open connections = %d, want 0 after Cancel", got)
+	}
+}
+
+func TestMetrics_UnexpectedDisconnectClosesConnection(t *testing.T) {
+	conn := newFakeConn()
+	notifier := newFakeNotifier()
+	mgr, sessions := newTestManager(t, conn, nil, notifier)
+	metrics := &fakeMetrics{}
+	mgr.SetMetrics(metrics)
+	mustSaveSession(t, sessions, testChatID)
+	if err := mgr.JoinQueue(context.Background(), testChatID, "SPORT"); err != nil {
+		t.Fatalf("JoinQueue returned error: %v", err)
+	}
+
+	conn.endListen()
+
+	select {
+	case <-notifier.disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for NotifyDisconnected")
+	}
+	if got := metrics.get(); got != 0 {
+		t.Errorf("open connections = %d, want 0 after an unexpected disconnect", got)
+	}
+}
+
+func TestMetrics_DetachClosesConnection(t *testing.T) {
+	conn := newFakeConn()
+	notifier := newFakeNotifier()
+	gameHandler := newFakeGameHandler()
+	sessions := session.NewMemoryStore()
+	dial := func(context.Context, string) (Connection, error) { return conn, nil }
+	mgr := NewManager(dial, notifier, sessions, gameHandler)
+	metrics := &fakeMetrics{}
+	mgr.SetMetrics(metrics)
+	mustSaveSession(t, sessions, testChatID)
+	if err := mgr.JoinQueue(context.Background(), testChatID, "SPORT"); err != nil {
+		t.Fatalf("JoinQueue returned error: %v", err)
+	}
+	conn.push(ws.Event{Success: true, Event: ws.EventMatchCreated, MetaData: []byte(`{"gameId":"g1"}`)})
+	select {
+	case <-notifier.matchCreated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for NotifyMatchCreated")
+	}
+
+	mgr.Detach(testChatID)
+
+	if got := metrics.get(); got != 0 {
+		t.Errorf("open connections = %d, want 0 after Detach", got)
 	}
 }

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: telegram-bot-configmap
+data:
+  user-service-url: "http://traefik-service/user-service"
+  match-service-url: "http://traefik-service/match-service"
+  game-service-ws-url: "ws://traefik-service/game-service/api/v1/process-game"
+  session-store-type: "redis"
+  session-store-redis-addr: "redis-service:6379"
+  # metrics must stay enabled for the Deployment's livenessProbe (which
+  # hits /metrics) to succeed — see deploy/deployment.yaml's top comment
+  # for why replicas must also stay at 1.
+  metrics-enabled: "true"
+  metrics-listen-addr: ":9090"
+  logging-level: "info"

@@ -22,6 +22,23 @@ type Sender interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
 }
 
+// Metrics is the subset of internal/metrics.Recorder this package depends
+// on, defined here (the consumer) so tests don't need a real Prometheus
+// registry — mirrors this codebase's established pattern (e.g.
+// internal/core/auth.UserAPI). *metrics.Recorder satisfies this.
+type Metrics interface {
+	CommandHandled(command string)
+	CallbackHandled(data string)
+}
+
+// noopMetrics is Bot's default Metrics — SetMetrics is optional, and every
+// call site should be able to assume b.metrics is never nil rather than
+// checking on every dispatch.
+type noopMetrics struct{}
+
+func (noopMetrics) CommandHandled(string)  {}
+func (noopMetrics) CallbackHandled(string) {}
+
 // CommandHandler builds a reply for a recognized command message. It
 // receives the raw *tgbotapi.Message because, unlike internal/core, this
 // package is explicitly allowed to know about Telegram's wire types — the
@@ -56,6 +73,7 @@ type TextHandler func(ctx context.Context, msg *tgbotapi.Message) (reply tgbotap
 type Bot struct {
 	api              Sender
 	logger           *slog.Logger
+	metrics          Metrics
 	commands         map[string]CommandHandler
 	callbacks        map[string]CallbackHandler
 	callbackPrefixes []callbackPrefixEntry
@@ -64,14 +82,23 @@ type Bot struct {
 
 // New builds a Bot. api and logger are required dependencies, injected by
 // the caller (cmd/bot/main.go) rather than constructed internally, so Bot
-// itself never reaches for global state.
+// itself never reaches for global state. Metrics default to a no-op — call
+// SetMetrics to record command/callback counts.
 func New(api Sender, logger *slog.Logger) *Bot {
 	return &Bot{
 		api:       api,
 		logger:    logger,
+		metrics:   noopMetrics{},
 		commands:  make(map[string]CommandHandler),
 		callbacks: make(map[string]CallbackHandler),
 	}
+}
+
+// SetMetrics installs m as this Bot's Metrics recorder, replacing the
+// default no-op. Exposed as a setter (like matchmaking.Manager's
+// SetGameHandler) so tests and simple callers can ignore metrics entirely.
+func (b *Bot) SetMetrics(m Metrics) {
+	b.metrics = m
 }
 
 // RegisterCommand associates a command name (without the leading "/") with
@@ -142,6 +169,7 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		b.logger.Debug("unrecognized command", "command", command, "chat_id", msg.Chat.ID)
 		return
 	}
+	b.metrics.CommandHandled(command)
 
 	reply, err := handler(ctx, msg)
 	if err != nil {
@@ -157,12 +185,17 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	}
 
 	if handler, ok := b.callbacks[cb.Data]; ok {
+		b.metrics.CallbackHandled(cb.Data)
 		b.dispatchCallback(ctx, cb, handler)
 		return
 	}
 
 	for _, p := range b.callbackPrefixes {
 		if data, ok := strings.CutPrefix(cb.Data, p.prefix); ok {
+			// Record the prefix, not the full data (e.g. "answer:", never
+			// "answer:<questionID>|<index>") — the latter would mint a new,
+			// never-reused Prometheus time series per question.
+			b.metrics.CallbackHandled(p.prefix)
 			prefixHandler := p.handler
 			b.dispatchCallback(ctx, cb, func(ctx context.Context, cb *tgbotapi.CallbackQuery) (tgbotapi.Chattable, error) {
 				return prefixHandler(ctx, cb, data)

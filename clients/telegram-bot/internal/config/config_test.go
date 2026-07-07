@@ -115,6 +115,48 @@ rate_limit:
 	}
 }
 
+func TestLoad_Metrics(t *testing.T) {
+	path := writeTempConfig(t, `
+telegram:
+  bot_token: "yaml-token"
+backend:
+  user_service_url: "http://localhost/user-service"
+metrics:
+  enabled: true
+  listen_addr: ":9091"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if !cfg.Metrics.Enabled {
+		t.Error("Metrics.Enabled = false, want true")
+	}
+	if cfg.Metrics.ListenAddr != ":9091" {
+		t.Errorf("Metrics.ListenAddr = %q, want %q", cfg.Metrics.ListenAddr, ":9091")
+	}
+}
+
+func TestLoad_MetricsDefaultsToDisabled(t *testing.T) {
+	path := writeTempConfig(t, `
+telegram:
+  bot_token: "yaml-token"
+backend:
+  user_service_url: "http://localhost/user-service"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if cfg.Metrics.Enabled {
+		t.Error("Metrics.Enabled = true, want false when metrics section is omitted")
+	}
+}
+
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string

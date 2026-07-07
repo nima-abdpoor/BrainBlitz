@@ -187,7 +187,7 @@ Not yet built (explicitly out of scope per the plan, deferred to later phases): 
 
 ---
 
-## Phase 7 — Polish ❌ Not Started
+## Phase 7 — Polish ✅ Implemented
 
 **Goals**: Production-readiness.
 
@@ -206,6 +206,8 @@ Not yet built (explicitly out of scope per the plan, deferred to later phases): 
 
 **Files/modules to create**: `deploy/Dockerfile`, `deploy/*.yaml`, test files across `internal/core/*`, `README.md`.
 
+**Implementation notes (2026-07-08)**: `internal/metrics.Recorder` (own `prometheus.Registry`, not the global one) instruments `bot_commands_total`, `bot_callbacks_total`, `bot_http_request_duration_seconds`, `bot_http_request_errors_total`, `bot_active_ws_connections` — wired via optional `Metrics` interfaces + `noopMetrics` defaults into `apiclient/http.Client` (`WithMetrics`), `core/matchmaking.Manager` (`SetMetrics`), and `telegram.Bot` (`SetMetrics`), served at `/metrics` by an `http.Server` `cmd/bot/main.go` starts/stops only when `metrics.enabled` (new `config.Metrics` section; default off, zero behavior change). Structured-logging audit (every `log.*`/`slog.*` call site across `internal/` and `cmd/`) found zero instances of a token, password, or secret being logged — auth/session/profile code only ever holds a password in a local variable for the duration of one request. Added build-tagged (`//go:build integration`) tests in a new `integration/` package: full register→login→profile round-trip and a wrong-password case against a real user-service, plus a real two-player `SPORT`-queue match against a real game-service over an actual WebSocket — each does its own reachability check and `t.Skip`s (not fails) if the backend it needs isn't running, so `go test -tags=integration ./...` is safe without `docker-compose up`. Added `deploy/Dockerfile` (multi-stage, `golang:1.23` → `debian:bookworm-slim`, build context is `clients/telegram-bot/` itself since this is its own Go module — unlike the backend's shared-module Dockerfiles) plus `deploy/{deployment,configmap,secret}.yaml` mirroring `infra/kubernetes/` conventions; `deploy/README.md` documents the one deployment constraint specific to this bot: **replicas must stay at 1** (Telegram long-polling `getUpdates` has no fan-out across consumers of the same token — a second replica double-handles updates), enforced via `strategy: Recreate` instead of `RollingUpdate`. `README.md` (new, repo root of the module) covers setup, config, metrics, logging, testing, and links to the deployment guide. Docker build and container startup were verified locally (image builds, binary runs, fails config validation cleanly without a token); the integration tests themselves could not be run against a *live* backend in this environment because the main repo's `docker-compose.yml` pins now-unresolvable Bitnami image tags (`bitnami/redis:6.2`, `bitnami/mongodb-exporter:0.43.0` both 404 on Docker Hub) — an existing, unrelated infra issue, not something introduced or fixed by this phase. `go build`/`go vet`/`gofmt -l`/`go test ./... -race` are all clean, both with and without `-tags=integration`.
+
 ---
 
 ## Summary Timeline
@@ -218,6 +220,6 @@ Not yet built (explicitly out of scope per the plan, deferred to later phases): 
 | 4. Matchmaking | 4-5 days | 14 days | ✅ Implemented |
 | 5. Gameplay | 6-8 days | 22 days | ✅ Implemented |
 | 6. Resilience | 4-5 days | 27 days | ✅ Implemented |
-| 7. Polish | 3-4 days | 31 days | ❌ Not started |
+| 7. Polish | 3-4 days | 31 days | ✅ Implemented |
 
 **Total: ~5-6 weeks solo**, excluding time for the backend improvements in `backend-improvements.md` that are recommended (not required) alongside this timeline. Phases 4-5 are the critical path and highest-risk; consider a spike/prototype of the WebSocket client against the real backend before committing to the full Phase 4 estimate.

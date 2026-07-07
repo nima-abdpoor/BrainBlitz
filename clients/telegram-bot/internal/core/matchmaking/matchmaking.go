@@ -104,6 +104,20 @@ type GameHandler interface {
 	Disconnected(chatID int64)
 }
 
+// Metrics is the subset of internal/metrics.Recorder this package depends
+// on, defined here (the consumer) so tests don't need a real Prometheus
+// registry.
+type Metrics interface {
+	WSConnectionOpened()
+	WSConnectionClosed()
+}
+
+// noopMetrics is Manager's default Metrics — SetMetrics is optional.
+type noopMetrics struct{}
+
+func (noopMetrics) WSConnectionOpened() {}
+func (noopMetrics) WSConnectionClosed() {}
+
 // chatSession is one chat's in-progress matchmaking attempt (or, once
 // onEvent is set, an in-progress game handed off to a GameHandler).
 type chatSession struct {
@@ -131,6 +145,7 @@ type Manager struct {
 	notifier    Notifier
 	sessions    session.Store
 	gameHandler GameHandler
+	metrics     Metrics
 
 	mu    sync.Mutex
 	chats map[int64]*chatSession
@@ -139,15 +154,25 @@ type Manager struct {
 // NewManager builds a Manager. dial, notifier, and sessions are required;
 // gameHandler may be nil (see GameHandler's doc comment). All are
 // interfaces/functions injected by the caller, so Manager never reaches for
-// a concrete WS client or storage backend directly.
+// a concrete WS client or storage backend directly. Metrics default to a
+// no-op — call SetMetrics to record the active-connections gauge.
 func NewManager(dial Dialer, notifier Notifier, sessions session.Store, gameHandler GameHandler) *Manager {
 	return &Manager{
 		dial:        dial,
 		notifier:    notifier,
 		sessions:    sessions,
 		gameHandler: gameHandler,
+		metrics:     noopMetrics{},
 		chats:       make(map[int64]*chatSession),
 	}
+}
+
+// SetMetrics installs m as this Manager's Metrics recorder, replacing the
+// default no-op.
+func (m *Manager) SetMetrics(metrics Metrics) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.metrics = metrics
 }
 
 // SetGameHandler installs h as this Manager's GameHandler. Exposed as a
@@ -205,9 +230,11 @@ func (m *Manager) JoinQueue(ctx context.Context, chatID int64, category string) 
 		m.abandon(chatID, cs)
 		return fmt.Errorf("connecting to game service: %w", err)
 	}
+	m.getMetrics().WSConnectionOpened()
 
 	if err := conn.Send(ws.Command{Command: ws.CommandAddToWaitingList, Category: category}); err != nil {
 		_ = conn.Close()
+		m.getMetrics().WSConnectionClosed()
 		m.abandon(chatID, cs)
 		return fmt.Errorf("joining queue: %w", err)
 	}
@@ -255,6 +282,7 @@ func (m *Manager) listen(chatID int64, conn Connection) {
 	if !stillOurs || err == nil {
 		return
 	}
+	m.getMetrics().WSConnectionClosed()
 	// Once the game layer has taken over (hadGame), it gives
 	// game-appropriate messaging via GameHandler.Disconnected instead of
 	// this package's generic "lost connection while waiting" text.
@@ -271,6 +299,14 @@ func (m *Manager) getGameHandler() GameHandler {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.gameHandler
+}
+
+// getMetrics returns the currently installed Metrics, safe for concurrent
+// use with SetMetrics.
+func (m *Manager) getMetrics() Metrics {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.metrics
 }
 
 func (m *Manager) handleEvent(chatID int64, event ws.Event) {
@@ -347,6 +383,7 @@ func (m *Manager) Detach(chatID int64) {
 
 	if ok {
 		_ = cs.conn.Close()
+		m.getMetrics().WSConnectionClosed()
 	}
 }
 
@@ -360,6 +397,7 @@ func (m *Manager) failQueue(chatID int64, cs *chatSession, reason string) {
 	m.mu.Unlock()
 
 	_ = cs.conn.Close()
+	m.getMetrics().WSConnectionClosed()
 	m.notifier.NotifyQueueFailed(chatID, reason)
 }
 
@@ -381,5 +419,7 @@ func (m *Manager) Cancel(chatID int64) error {
 	delete(m.chats, chatID)
 	m.mu.Unlock()
 
-	return cs.conn.Close()
+	err := cs.conn.Close()
+	m.getMetrics().WSConnectionClosed()
+	return err
 }
