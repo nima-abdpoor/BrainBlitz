@@ -2,7 +2,7 @@ version: '2.4'
 
 services:
   kafka:
-    image: 'bitnami/kafka:3.7.1'
+    image: 'soldevelo/kafka:3.7.1'
     container_name: kafka
     ports:
       - '9092:9092'
@@ -39,7 +39,7 @@ services:
       - bb-network
 
   bb-redis:
-    image: bitnami/redis:6.2
+    image: soldevelo/redis:6.2
     container_name: bb-redis
     restart: always
     ports:
