@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: redis
-          image: bitnami/redis:6.2
+          image: soldevelo/redis:6.2
           imagePullPolicy: Always
           ports:
             - protocol: TCP
